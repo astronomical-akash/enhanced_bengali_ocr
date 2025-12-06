@@ -10,6 +10,8 @@ import google.api_core.exceptions
 import tempfile
 import os
 from PIL import Image
+import re
+import math
 
 # --- Helper Functions ---
 
@@ -69,15 +71,14 @@ def get_valid_model(api_key):
         return supported_models[0].name
 
     except Exception as e:
-        # Re-raise with clarity or return None? User requested "raise a clear Exception" in logic description
-        # but helper functions often return None. I will raise here as implicitly requested by "raises a clear error".
         raise Exception(f"Failed to find a valid model: {str(e)}")
 
 def clean_with_gemini(text, api_key):
     """
     Uses Google Gemini to clean and format the OCR output.
-    Uses dynamic model selection and updated prompt for noise handling.
+    Uses dynamic model selection and batch processing for large texts.
     """
+    # 1. Validate Model
     try:
         model_name = get_valid_model(api_key)
     except Exception as e:
@@ -87,18 +88,56 @@ def clean_with_gemini(text, api_key):
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(model_name)
         
+        # 2. Split text into pages
+        # Regex to split by the delimiter we inserted: --- PAGE {n} ---
+        # We capture the content between delimiters.
+        # This split might produce empty strings at start/end, so we filter.
+        raw_pages = re.split(r'--- PAGE \d+ ---\n', text)
+        pages = [p.strip() for p in raw_pages if p.strip()]
+
+        if not pages:
+            # Fallback if delimiter check fails (e.g. pasted text without delimiters)
+            pages = [text]
+
+        # 3. Create Batches (Chunk size = 5 pages)
+        BATCH_SIZE = 5
+        batches = [pages[i:i + BATCH_SIZE] for i in range(0, len(pages), BATCH_SIZE)]
+        
+        cleaned_parts = []
+        total_batches = len(batches)
+        
+        # Streamlit progress bar (requires st to be imported)
+        progress_text = "AI Cleaning in progress. Please wait..."
+        my_bar = st.progress(0, text=progress_text)
+
         system_prompt = (
             "You are an expert Bengali and English editor. "
             "Clean OCR noise, correct spellings, and format the output in clean Markdown (headers, bullets). "
             "Keep the syllabus structure exactly as input. "
             "If you encounter jumbled text that looks like a failed OCR of a chart or diagram, "
-            "ignore it or summarize it as [Chart/Diagram]. Do not try to translate random noise."
+            "ignore it or summarize it as [Chart/Diagram]. Do not try to translate random noise. "
+            "Do not add introductory text like 'Here is the cleaned text'. Just output the cleaned content."
         )
+
+        for idx, batch in enumerate(batches):
+            # Join the batch pages back into a string for the context window
+            batch_text = "\n\n".join(batch)
+            
+            full_prompt = f"{system_prompt}\n\nHere is a part of the document (Part {idx+1}/{total_batches}):\n\n{batch_text}"
+            
+            # Generate
+            response = model.generate_content(full_prompt)
+            cleaned_parts.append(response.text)
+            
+            # Update progress
+            percent_complete = (idx + 1) / total_batches
+            my_bar.progress(percent_complete, text=f"AI Cleaning batch {idx+1}/{total_batches}...")
+
+        my_bar.empty() # Clear progress bar
         
-        full_prompt = f"{system_prompt}\n\nHere is the raw OCR text:\n\n{text}"
-        
-        response = model.generate_content(full_prompt)
-        return response.text, model_name
+        # 4. Combine
+        final_text = "\n\n".join(cleaned_parts)
+        return final_text, model_name
 
     except Exception as e:
         return f"Error connecting to Gemini ({model_name}): {str(e)}", model_name
